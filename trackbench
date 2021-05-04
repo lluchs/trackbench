@@ -7,8 +7,8 @@ fail() {
 	exit 1
 }
 
-base=${1:?base missing}
-cmd=${2:?cmd missing}
+base=${TRACKBENCH_BASE:?base missing}
+cmd=${1:?cmd missing}
 
 sql() {
 	sqlite3 "$base/db.sqlite3" -cmd "PRAGMA foreign_keys = ON" "$@"
@@ -16,6 +16,10 @@ sql() {
 
 record_cmd() {
 	sql "INSERT INTO log (cmd, args) VALUES ('$cmd', '${*/\'/\'\'}');" || fail "could not record command"
+}
+
+current_run() {
+	sql "SELECT max(id) FROM run;" || fail "could not determine current run id"
 }
 
 cmd_init() {
@@ -28,9 +32,7 @@ CREATE TABLE log (
 );
 
 CREATE TABLE run (
-	id INTEGER PRIMARY KEY,
-	cmd TEXT,
-	time REAL
+	id INTEGER PRIMARY KEY
 );
 
 CREATE TABLE prop (
@@ -38,6 +40,15 @@ CREATE TABLE prop (
 	key TEXT NOT NULL,
 	value,
 	PRIMARY KEY (runid, key)
+);
+
+CREATE TABLE exec (
+	id INTEGER PRIMARY KEY,
+	runid INTEGER NOT NULL REFERENCES run(id),
+	name TEXT,
+	cmd TEXT,
+	output BLOB,
+	time BLOB
 );
 SQL
 	record_cmd "$@"
@@ -48,46 +59,94 @@ cmd_assert() {
 	"$@" || fail assertion failed: "$@"
 }
 
-cmd_run() {
+# trackbench next-run [<key>=<value>]...
+# Begins the next run with the given properties.
+cmd_next-run() {
 	record_cmd "$@"
 
 	runid=$(sql 'INSERT INTO run DEFAULT VALUES; SELECT last_insert_rowid();')
 	[[ -z $runid ]] && fail "could not insert run"
 	echo "runid=$runid"
 
-	while [[ "$1" =~ '=' ]]; do
+	while [[ "${1-}" =~ '=' ]]; do
 		key=${1%%=*}
 		val=${1#*=}
 		sql "INSERT INTO prop (runid, key, value) VALUES ($runid, '${key/\'/\'\'}', '${val/\'/\'\'}');" || fail "could not insert prop $key=$val"
 		shift
 	done
-
-	# assume GNU time
-	basename="$base/run$(printf '%03d' $runid)"
-	env time -o "$basename.time" -- "$@" |& tee "$basename.log"
-
-	sql "UPDATE run SET cmd = '${*/\'/\'\'}' WHERE id = $runid;" || fail "could not set cmd"
 }
 
+# trackbench exec <name> <cmd...>
+# Runs the command (as part of a run) and captures its output.
+cmd_exec() {
+	record_cmd "$@"
+
+	name=$1
+	shift
+	runid=$(current_run)
+	echo "runid=$runid"
+
+	# assume GNU time
+	path="$base/results/run$(printf '%03d' $runid)"
+	mkdir -p "$path"
+	output="$path/$name.log"
+	time="$path/$name.time.txt"
+	env time -o "$time" -- "$@" |& tee "$output"
+
+	sql "INSERT INTO exec (runid, name, cmd, output, time) VALUES ($runid, '${name/\'/\'\'}', '${*/\'/\'\'}', readfile('$output'), readfile('$time'));" || fail "could not set cmd"
+}
+
+# trackbench attach-string <key> <value>
+# Attaches a string property to a run.
+cmd_attach-string() {
+	record_cmd "$@"
+
+	runid=$(current_run)
+	key=$1
+	val=$2
+	sql "INSERT INTO prop (runid, key, value) VALUES ($runid, '${key/\'/\'\'}', '${val/\'/\'\'}');" || fail "could not insert prop $key=$val"
+}
+
+# trackbench attach-file <key> <filename>
+# Attaches a file property to a run.
+cmd_attach-file() {
+	record_cmd "$@"
+
+	runid=$(current_run)
+	key=$1
+	filename=$2
+	sql "INSERT INTO prop (runid, key, value) VALUES ($runid, '${key/\'/\'\'}', readfile('${filename/\'/\'\'}'));" || fail "could not insert file prop $key=<$filename>"
+}
+
+# trackbench finish
+# Creates the run_prop view for evaluation.
 cmd_finish() {
 	record_cmd "$@"
 
 	# build "wide" view with all props
 	(
 		echo "CREATE VIEW run_prop AS "
-		echo "SELECT id, cmd"
-		# TODO: IFS=\n
-		for key in $(sql "SELECT DISTINCT key from prop;"); do
-			echo ", GROUP_CONCAT(CASE WHEN prop.key = '$key' THEN prop.value END) $key"
-		done
+		echo "SELECT run.id id"
+		(
+			IFS=$'\n'
+			for key in $(sql "SELECT DISTINCT key from prop;"); do
+				col=$(echo -n "$key" | tr -c 'a-zA-Z' _)
+				echo ", GROUP_CONCAT(CASE WHEN prop.key = '$key' THEN prop.value END) $col"
+			done
+			for name in $(sql "SELECT DISTINCT name from exec;"); do
+				col=$(echo -n "$name" | tr -c 'a-zA-Z' _)
+				echo ", GROUP_CONCAT(CASE WHEN exec.name = '$name' THEN exec.output END) ${col}_output"
+				echo ", GROUP_CONCAT(CASE WHEN exec.name = '$name' THEN exec.time END) ${col}_time"
+			done
+		)
 		echo "FROM run"
 		echo "LEFT JOIN prop ON run.id = prop.runid"
+		echo "LEFT JOIN exec ON run.id = exec.runid"
 		echo "GROUP BY run.id"
 		echo ";"
 	) | sql || fail "could not create run_prop view"
 }
 
-shift
 shift
 
 "cmd_$cmd" "$@"
