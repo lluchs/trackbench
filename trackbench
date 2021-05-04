@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+
+set -u
+
+fail() {
+	echo >/dev/stderr error: "$@"
+	exit 1
+}
+
+base=${1:?base missing}
+cmd=${2:?cmd missing}
+
+sql() {
+	sqlite3 "$base/db.sqlite3" -cmd "PRAGMA foreign_keys = ON" "$@"
+}
+
+record_cmd() {
+	sql "INSERT INTO log (cmd, args) VALUES ('$cmd', '${*/\'/\'\'}');" || fail "could not record command"
+}
+
+cmd_init() {
+	mkdir "$base" || fail "base directory $base already exists"
+	sql <<SQL || fail "could not init sqlite db"
+CREATE TABLE log (
+	id INTEGER PRIMARY KEY,
+	cmd TEXT NOT NULL,
+	args TEXT
+);
+
+CREATE TABLE run (
+	id INTEGER PRIMARY KEY,
+	cmd TEXT,
+	time REAL
+);
+
+CREATE TABLE prop (
+	runid INTEGER NOT NULL REFERENCES run(id),
+	key TEXT NOT NULL,
+	value,
+	PRIMARY KEY (runid, key)
+);
+SQL
+	record_cmd "$@"
+}
+
+cmd_assert() {
+	record_cmd "$@"
+	"$@" || fail assertion failed: "$@"
+}
+
+cmd_run() {
+	record_cmd "$@"
+
+	runid=$(sql 'INSERT INTO run DEFAULT VALUES; SELECT last_insert_rowid();')
+	[[ -z $runid ]] && fail "could not insert run"
+	echo "runid=$runid"
+
+	while [[ "$1" =~ '=' ]]; do
+		key=${1%%=*}
+		val=${1#*=}
+		sql "INSERT INTO prop (runid, key, value) VALUES ($runid, '${key/\'/\'\'}', '${val/\'/\'\'}');" || fail "could not insert prop $key=$val"
+		shift
+	done
+
+	# assume GNU time
+	basename="$base/run$(printf '%03d' $runid)"
+	env time -o "$basename.time" -- "$@" |& tee "$basename.log"
+
+	sql "UPDATE run SET cmd = '${*/\'/\'\'}' WHERE id = $runid;" || fail "could not set cmd"
+}
+
+cmd_finish() {
+	record_cmd "$@"
+
+	# build "wide" view with all props
+	(
+		echo "CREATE VIEW run_prop AS "
+		echo "SELECT id, cmd"
+		# TODO: IFS=\n
+		for key in $(sql "SELECT DISTINCT key from prop;"); do
+			echo ", GROUP_CONCAT(CASE WHEN prop.key = '$key' THEN prop.value END) $key"
+		done
+		echo "FROM run"
+		echo "LEFT JOIN prop ON run.id = prop.runid"
+		echo "GROUP BY run.id"
+		echo ";"
+	) | sql || fail "could not create run_prop view"
+}
+
+shift
+shift
+
+"cmd_$cmd" "$@"
